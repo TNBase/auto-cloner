@@ -1,0 +1,3 @@
+huggingfac_hub
+GitPython
+psutil

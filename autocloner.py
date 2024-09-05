@@ -103,7 +103,7 @@ def clone_and_upload_hf_repo(config):
             # Create a new model repository in the TitanML organization on Hugging Face
             new_repo_id = f"{organization}/{repo_name}"  # Construct repo_id as organization/repo_name
             print(f"Creating new model repository under organization {organization}...")
-            repo_url = api.create_repo(repo_id=new_repo_id, exist_ok=True).clone_url
+            repo_url = api.create_repo(repo_id=new_repo_id, exist_ok=True).git_url
 
             # Initialize a new Git repository and push to Hugging Face
             os.chdir(cloned_repo_dir)

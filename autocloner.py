@@ -43,11 +43,24 @@ def setup_git_lfs(repo_dir):
 # Function to create and load cache
 def load_cache():
     if not os.path.exists(".cache"):
-        os.makedirs(".cache")
-    if os.path.exists(CACHE_FILE):
+        os.makedirs(".cache")  # Ensure the .cache directory exists
+    
+    if not os.path.exists(CACHE_FILE):
+        # If cache file doesn't exist, create it and return an empty cache
+        with open(CACHE_FILE, "w") as f:
+            json.dump({}, f)
+        return {}
+    
+    try:
+        # If the cache file exists, load it
         with open(CACHE_FILE, "r") as f:
             return json.load(f)
-    return {}
+    except json.JSONDecodeError:
+        # If cache file is corrupted, print a message and reinitialize it
+        print("Cache file is corrupted. Reinitializing cache...")
+        with open(CACHE_FILE, "w") as f:
+            json.dump({}, f)
+        return {}
 
 # Function to save cache
 def save_cache(cache):

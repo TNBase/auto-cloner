@@ -33,3 +33,7 @@ git lfs install
 ```bash
 git lfs track "*.bin" "*.pit" "*.ckpt"
 ```
+
+```bash
+huggingface-cli lfs-enable-largefiles .
+```

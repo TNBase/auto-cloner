@@ -16,6 +16,14 @@ git config --global user.email "your-email@example.com"
 
 ## Step 2
 
+Install all the necessary packages with the code below after navigating to the root directory of this project.
+
+``` bash
+pip install -r requirements.txt
+```
+
+## Step 3
+
 To clone repositories on huggingface as well as uploading large files you need to run the code below on your terminal
 
 ``` bash

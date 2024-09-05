@@ -88,10 +88,10 @@ def clone_and_upload_hf_repo(config):
 
     for hf_repo_url in config['repositories']:
         repo_name = hf_repo_url.split("/")[-1]
+        cloned_repo_dir = f"cloned_{repo_name}"
+
         print(f"\nCloning repository: {hf_repo_url}")
         try:
-            cloned_repo_dir = f"cloned_{repo_name}"
-
             # Clone the repo
             Repo.clone_from(hf_repo_url, cloned_repo_dir)
 
@@ -101,8 +101,9 @@ def clone_and_upload_hf_repo(config):
                 shutil.rmtree(git_dir)
 
             # Create a new model repository in the TitanML organization on Hugging Face
+            new_repo_id = f"{organization}/{repo_name}"  # Construct repo_id as organization/repo_name
             print(f"Creating new model repository under organization {organization}...")
-            repo_url = api.create_repo(repo_id=repo_name, organization=organization, exist_ok=True).clone_url
+            repo_url = api.create_repo(repo_id=new_repo_id, exist_ok=True).clone_url
 
             # Initialize a new Git repository and push to Hugging Face
             os.chdir(cloned_repo_dir)
@@ -113,13 +114,15 @@ def clone_and_upload_hf_repo(config):
             subprocess.run(["git", "branch", "-M", "main"], check=True)
             subprocess.run(["git", "push", "-u", "origin", "main"], check=True)
 
-        except GitCommandError as e:
-            print(f"Error occurred while cloning {hf_repo_url}: {e}")
+        except (GitCommandError, Exception) as e:
+            print(f"Error occurred while processing repository {hf_repo_url}: {e}")
         finally:
-            # Clean up by deleting the cloned directory
+            # Clean up by deleting the cloned directory, even if an error occurs
             if os.path.exists(cloned_repo_dir):
+                print(f"Cleaning up {cloned_repo_dir} due to error or completion.")
                 shutil.rmtree(cloned_repo_dir)
 
+    # Track resource usage and completion message
     track_resource_usage(start_time)
     print("Done cloning all repositories.")
 

@@ -2,9 +2,10 @@ import os
 import yaml
 import shutil
 import subprocess
+import time
+import psutil
 from git import Repo, GitCommandError
 from huggingface_hub import HfApi, HfFolder, create_repo
-import psutil
 
 CONFIG_FILE = "config.yaml"
 
@@ -15,6 +16,7 @@ def load_config():
         config = {
             'huggingface': {'token': ''},
             'git': {'username': '', 'email': ''},
+            'organization': 'TitanML',
             'repositories': []
         }
         save_config(config)
@@ -28,13 +30,25 @@ def save_config(config):
     with open(CONFIG_FILE, "w") as f:
         yaml.dump(config, f)
 
+# Function to track system resource usage
+def track_resource_usage(start_time):
+    cpu_usage = psutil.cpu_percent(interval=1)
+    total_ram = psutil.virtual_memory().total / (1024 ** 3)  # in GB
+    used_ram = psutil.virtual_memory().used / (1024 ** 3)  # in GB
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+
+    print(f"\nTotal time taken: {elapsed_time:.2f} seconds")
+    print(f"CPU usage: {cpu_usage}%")
+    print(f"Total RAM: {total_ram:.2f} GB, Used RAM: {used_ram:.2f} GB")
+
 # Function to prompt for Hugging Face login and update config
 def update_huggingface_login(config):
     token = config['huggingface'].get('token', '')
 
     if not token:
-        print("Please log in to Hugging Face.")
-        token = input("Enter your Hugging Face API token: ").strip()
+        print("Please log in to Hugging Face (dtzx account).")
+        token = input("Enter your Hugging Face API token (for dtzx): ").strip()
         config['huggingface']['token'] = token
         save_config(config)
 
@@ -46,13 +60,13 @@ def update_git_login(config):
     email = config['git'].get('email', '')
 
     if not username or not email:
-        print("Please log in to Git.")
+        print("Please log in to Git (zhixitee GitHub account).")
         if not username:
-            username = input("Enter your Git username: ").strip()
+            username = input("Enter your GitHub username (zhixitee): ").strip()
             config['git']['username'] = username
 
         if not email:
-            email = input("Enter your Git email: ").strip()
+            email = input("Enter your GitHub email: ").strip()
             config['git']['email'] = email
 
         save_config(config)
@@ -61,29 +75,36 @@ def update_git_login(config):
     subprocess.run(["git", "config", "--global", "user.name", username], check=True)
     subprocess.run(["git", "config", "--global", "user.email", email], check=True)
 
-# Function to clone and upload repos
+# Function to clone and upload repos as model repositories
 def clone_and_upload_hf_repo(config):
     api = HfApi()
-    
     hf_token = config['huggingface'].get('token', '')
+    organization = config.get('organization', 'TitanML')
+    
     if not hf_token:
         raise ValueError("Hugging Face token is missing. Please check your config file.")
     
+    start_time = time.time()
+
     for hf_repo_url in config['repositories']:
         repo_name = hf_repo_url.split("/")[-1]
-        print(f"Cloning repository: {hf_repo_url}")
+        print(f"\nCloning repository: {hf_repo_url}")
         try:
             cloned_repo_dir = f"cloned_{repo_name}"
-            
+
             # Clone the repo
             Repo.clone_from(hf_repo_url, cloned_repo_dir)
 
-            # Create a new repository in Hugging Face
-            new_repo_full_name = f"{config['git']['username']}/{repo_name}"
-            print(f"Creating new repository {new_repo_full_name}...")
-            repo_url = api.create_repo(repo_id=new_repo_full_name, exist_ok=True).clone_url
+            # Remove the .git directory from the cloned repo
+            git_dir = os.path.join(cloned_repo_dir, ".git")
+            if os.path.exists(git_dir):
+                shutil.rmtree(git_dir)
 
-            # Stage, commit, and push files to the new Hugging Face repository
+            # Create a new model repository in the TitanML organization on Hugging Face
+            print(f"Creating new model repository under organization {organization}...")
+            repo_url = api.create_repo(repo_id=repo_name, organization=organization, exist_ok=True).clone_url
+
+            # Initialize a new Git repository and push to Hugging Face
             os.chdir(cloned_repo_dir)
             subprocess.run(["git", "init"], check=True)
             subprocess.run(["git", "remote", "add", "origin", repo_url], check=True)
@@ -99,18 +120,19 @@ def clone_and_upload_hf_repo(config):
             if os.path.exists(cloned_repo_dir):
                 shutil.rmtree(cloned_repo_dir)
 
+    track_resource_usage(start_time)
+    print("Done cloning all repositories.")
+
 # Main function
 if __name__ == "__main__":
     # Load the config file
     config = load_config()
 
-    # Update Hugging Face login
+    # Update Hugging Face login (dtzx account)
     update_huggingface_login(config)
 
-    # Update Git login
+    # Update Git login (zhixitee GitHub account)
     update_git_login(config)
 
     # Clone and upload repositories
     clone_and_upload_hf_repo(config)
-
-    print("All repositories processed.")

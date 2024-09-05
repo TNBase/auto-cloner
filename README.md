@@ -28,16 +28,8 @@ To clone repositories on huggingface as well as uploading large files you need t
 
 ``` bash
 git lfs install
-```
-
-```bash
 git lfs track "*.bin" "*.pit" "*.ckpt"
-```
-
-```bash
 huggingface-cli lfs-enable-largefiles .
-```
-
-```bash
 echo ".cache" >> .gitignore
+echo "config.yaml" >> .gitignore
 ```

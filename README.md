@@ -37,3 +37,7 @@ git lfs track "*.bin" "*.pit" "*.ckpt"
 ```bash
 huggingface-cli lfs-enable-largefiles .
 ```
+
+```bash
+echo ".cache" >> .gitignore
+```

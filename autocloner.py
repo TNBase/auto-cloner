@@ -1,4 +1,5 @@
 import os
+import json
 import shutil
 import subprocess
 import time
@@ -6,9 +7,10 @@ from git import Repo, GitCommandError
 from huggingface_hub import HfApi, HfFolder, create_repo
 import psutil  # To check system specs
 
+CACHE_FILE = ".cache/repo_cache.json"
+
 # Function to estimate time for cloning and uploading
 def estimate_time_and_resources(repo_size, upload_speed):
-    # Estimation based on a basic bandwidth and system usage
     download_time = repo_size / (psutil.net_io_counters().bytes_recv + 1)  # in seconds
     upload_time = repo_size / (upload_speed + 1)  # in seconds
     
@@ -25,36 +27,48 @@ def check_system_resources():
 # Function to set up Git LFS
 def setup_git_lfs(repo_dir):
     try:
-        # Initialize Git LFS
         print("Initializing Git LFS...")
         subprocess.run(["git", "lfs", "install"], check=True)
 
-        # Change directory to the cloned repository
         os.chdir(repo_dir)
 
-        # Track common large file extensions
         print("Configuring Git LFS to track large file types (*.bin, *.pt, *.ckpt)...")
         subprocess.run(["git", "lfs", "track", "*.bin", "*.pt", "*.ckpt"], check=True)
 
-        # Add .gitattributes to repository
         subprocess.run(["git", "add", ".gitattributes"], check=True)
         print("Git LFS setup completed.")
     except subprocess.CalledProcessError as e:
         print(f"Error setting up Git LFS: {e}")
 
-# Function to clone a repo, remove .git, and upload it to Hugging Face
-def clone_and_upload_hf_repo(hf_repo_urls, org_name):
+# Function to create and load cache
+def load_cache():
+    if not os.path.exists(".cache"):
+        os.makedirs(".cache")
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+# Function to save cache
+def save_cache(cache):
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+
+# Function to clone and upload repos
+def clone_and_upload_hf_repo(hf_repo_urls, org_name, cache):
     api = HfApi()
     
-    # Ensure Hugging Face login
     if not HfFolder.get_token():
         raise ValueError("Please login to Hugging Face using `huggingface-cli login`.")
     
     for hf_repo_url in hf_repo_urls:
         repo_name = hf_repo_url.split("/")[-1]
-        print(f"Cloning repository: {hf_repo_url}")
         
-        # Cloning the repository
+        if hf_repo_url in cache:
+            print(f"Skipping {hf_repo_url}, already processed.")
+            continue
+        
+        print(f"Cloning repository: {hf_repo_url}")
         try:
             cloned_repo_dir = f"cloned_{repo_name}"
             start_time = time.time()
@@ -62,12 +76,12 @@ def clone_and_upload_hf_repo(hf_repo_urls, org_name):
             # Clone the repo
             Repo.clone_from(hf_repo_url, cloned_repo_dir)
 
-            # Setup Git LFS for large files in the cloned repository
+            # Setup Git LFS for large files
             setup_git_lfs(cloned_repo_dir)
 
             # Estimate time and system resources
             repo_size = sum(os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(cloned_repo_dir) for f in files)
-            upload_speed = psutil.net_io_counters().bytes_sent  # Rough estimate of upload speed
+            upload_speed = psutil.net_io_counters().bytes_sent
             download_time, upload_time = estimate_time_and_resources(repo_size, upload_speed)
             cpu_usage, total_ram, free_ram = check_system_resources()
 
@@ -93,10 +107,15 @@ def clone_and_upload_hf_repo(hf_repo_urls, org_name):
                 folder_path=cloned_repo_dir,
                 repo_id=new_repo_full_name,
             )
+
             end_time = time.time()
             elapsed_time = end_time - start_time
             print(f"Repository {new_repo_full_name} successfully uploaded in {elapsed_time:.2f} seconds.")
-        
+
+            # Add repo to cache and save
+            cache[hf_repo_url] = {"status": "uploaded"}
+            save_cache(cache)
+
         except GitCommandError as e:
             print(f"Error occurred while cloning {hf_repo_url}: {e}")
         
@@ -107,7 +126,6 @@ def clone_and_upload_hf_repo(hf_repo_urls, org_name):
             print(f"Unexpected error: {e}")
         
         finally:
-            # Clean up
             if os.path.exists(cloned_repo_dir):
                 shutil.rmtree(cloned_repo_dir)
 
@@ -115,19 +133,24 @@ def clone_and_upload_hf_repo(hf_repo_urls, org_name):
 
 # Main Function
 if __name__ == "__main__":
-    # Prompt user to login to Git
+    # Git Login Check
     try:
-        print("Please ensure you're logged into Git. Logging in...")
+        print("Please ensure you're logged into Git.")
         subprocess.run(["git", "config", "--global", "credential.helper", "cache"], check=True)
-        subprocess.run(["git", "config", "--global", "user.name"], check=True)
     except subprocess.CalledProcessError:
         print("Git login failed. Please login using `git config --global user.name` and `git config --global user.email`.")
     
-    # Input repository URLs and organization details
-    hf_repo_urls = [
-        "https://huggingface.co/username/repo1",
-        "https://huggingface.co/username/repo2"
-    ]
-    org_name = "your-organization-name"
+    # Load cache
+    cache = load_cache()
 
-    clone_and_upload_hf_repo(hf_repo_urls, org_name)
+    # Get user input
+    org_name = input("Enter the Hugging Face organization name: ").strip()
+    hf_repo_urls = input("Enter the repository URLs to clone (comma-separated): ").strip().split(',')
+
+    # Remove extra spaces from each URL
+    hf_repo_urls = [url.strip() for url in hf_repo_urls]
+
+    # Run the clone and upload process
+    clone_and_upload_hf_repo(hf_repo_urls, org_name, cache)
+
+    print("All repositories processed.")

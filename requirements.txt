@@ -1,4 +1,4 @@
-huggingface_hub==0.17.1  # Or latest version
-GitPython==3.1.32        # Or latest version
-psutil==5.9.4            # Or latest version
-PyYAML==6.0              # For reading and writing YAML files
+huggingface_hub  # Or latest version
+GitPython       # Or latest version
+psutil           # Or latest version
+PyYAML             # For reading and writing YAML files

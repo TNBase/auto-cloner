@@ -14,7 +14,7 @@ def load_config():
     if not os.path.exists(CONFIG_FILE):
         print(f"{CONFIG_FILE} not found. Creating a new one...")
         config = {
-            'huggingface': {'token': ''},
+            'huggingface': {'username': 'dtzx', 'token': ''},
             'git': {'username': '', 'email': ''},
             'organization': 'TitanML',
             'repositories': []
@@ -78,9 +78,10 @@ def update_git_login(config):
 # Function to clone and upload repos as model repositories
 def clone_and_upload_hf_repo(config):
     api = HfApi()
-    hf_token = config['huggingface'].get('token', '')
+    hf_username = config['huggingface']['username']
+    hf_token = config['huggingface']['token']
     organization = config.get('organization', 'TitanML')
-    
+
     if not hf_token:
         raise ValueError("Hugging Face token is missing. Please check your config file.")
     
@@ -105,10 +106,13 @@ def clone_and_upload_hf_repo(config):
             print(f"Creating new model repository under organization {organization}...")
             repo_url = api.create_repo(repo_id=new_repo_id, exist_ok=True).git_url
 
+            # Embed Hugging Face credentials into the remote URL for Git push
+            remote_url_with_creds = repo_url.replace("https://", f"https://{hf_username}:{hf_token}@")
+
             # Initialize a new Git repository and push to Hugging Face
             os.chdir(cloned_repo_dir)
             subprocess.run(["git", "init"], check=True)
-            subprocess.run(["git", "remote", "add", "origin", repo_url], check=True)
+            subprocess.run(["git", "remote", "add", "origin", remote_url_with_creds], check=True)
             subprocess.run(["git", "add", "."], check=True)
             subprocess.run(["git", "commit", "-m", "populate repo"], check=True)
             subprocess.run(["git", "branch", "-M", "main"], check=True)

@@ -1,4 +1,2 @@
-huggingface_hub  # Or latest version
-GitPython       # Or latest version
-psutil           # Or latest version
-PyYAML             # For reading and writing YAML files
+huggingface_hub==0.24.2  # Or latest version
+loguru==0.7.2

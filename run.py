@@ -4,36 +4,72 @@ import sys
 from pathlib import Path
 from loguru import logger
 from utils import download_from_hf, push_to_hub
+import asyncio
+import psutil
+from huggingface_hub import HfApi
+from requests.exceptions import HTTPError
 
-def download_and_upload_model(repo_name: str, local_download_model_dir: str, token: str) -> None:
-    """
-    downloads a model from hugging face, uploads it to a target repository, and deletes the local copy.
-    """
+api = HfApi()
 
+async def get_model_size(repo_name: str, token: str) -> float:
+    """
+    Fetches the total size of the model files in gigabytes from Hugging Face.
+    """
+    try:
+        model_info = api.model_info(repo_name, token=token)
+        total_size_bytes = sum(file.size for file in model_info.siblings if file.size is not None)
+        total_size_gb = total_size_bytes / (1024 ** 3)  # Convert bytes to GB
+        return total_size_gb
+    except Exception as e:
+        logger.error(f"Failed to retrieve size for {repo_name}: {e}")
+        raise e
+
+async def repo_exists(repo_name: str, token: str) -> bool:
+    """
+    Check if the repo already exists on Hugging Face.
+    """
+    try:
+        api.repo_info(repo_id=repo_name.split("/")[-1], token=token)
+        return True
+    except HTTPError as e:
+        if e.response.status_code == 404:
+            return False
+        else:
+            logger.error(f"Error checking repo existence for {repo_name}: {e}")
+            raise e
+
+async def download_and_upload_model(repo_name: str, local_download_model_dir: str, token: str) -> None:
+    """
+    Downloads a model from Hugging Face, uploads it to a target repository, and deletes the local copy.
+    """
     try:
         local_model_dir = Path(local_download_model_dir) / Path(repo_name)
         model_name = repo_name.split("/")[-1]
 
-        # check if model already exists locally
+        # Skip download if model already exists locally
         if local_model_dir.exists():
             logger.warning(f"Model directory {local_model_dir} already exists. Skipping download.")
         else:
-            # download the model
-            logger.info(f"Starting download for {repo_name}")
+            model_size = await get_model_size(repo_name, token)
+            logger.info(f"Starting download for {repo_name} (Estimated size: {model_size:.2f} GB)")
             download_from_hf(repo_name=repo_name, local_model_dir=local_model_dir, file_name=None, token=token)
             logger.info(f"Successfully downloaded model: {repo_name}")
 
-        # upload the model
-        logger.info(f"Starting upload for {model_name}")
+        # Upload the model if repo doesn't already exist
+        if await repo_exists(model_name, token):
+            logger.info(f"Repository {model_name} already exists. Skipping creation.")
+        else:
+            logger.info(f"Creating repository {model_name}")
+            api.create_repo(repo_id=model_name, token=token, repo_type="model")
+
         push_to_hub(model_name=model_name, model_path=local_model_dir, token=token)
         logger.info(f"Successfully uploaded model: {model_name}")
 
-    except (OSError, ValueError) as e:  # Example of more specific exception handling
-        logger.error(f"Error during the process for {repo_name}. Detailed error: {e}")
-        raise e  # re-raise the exception to be handled by the main loop
+    except Exception as e:
+        logger.error(f"Error during process for {repo_name}. Error: {e}")
 
     finally:
-        # Ensure cleanup happens even if there's an error
+        # Ensure cleanup happens
         try:
             if local_model_dir.exists():
                 logger.info(f"Cleaning up local model directory for {model_name}")
@@ -42,12 +78,114 @@ def download_and_upload_model(repo_name: str, local_download_model_dir: str, tok
         except OSError as cleanup_error:
             logger.error(f"Failed to clean up model directory {local_model_dir}. Error: {cleanup_error}")
 
+def get_free_space_gb() -> float:
+    """Returns the available disk space in gigabytes."""
+    return psutil.disk_usage("/").free / (1024 ** 3)
+
+async def process_model_queue(repo_name_queue, local_download_model_dir, token):
+    """
+    Processes the queue of models and ensures the disk space constraints are met.
+    """
+    active_downloads = []  # Track active downloads
+    total_space_to_use = 900  # The total space the script can use (900GB)
+    min_free_space = 100  # Leave 100GB free at all times
+    download_model_sizes = {}  # Store estimated model sizes to manage space
+
+    while repo_name_queue:
+        repo_name = repo_name_queue[0]
+        free_space = get_free_space_gb()
+
+        # Estimate model size using Hugging Face API
+        try:
+            model_size = await get_model_size(repo_name, token)
+        except Exception as e:
+            logger.error(f"Skipping model {repo_name} due to error: {e}")
+            repo_name_queue.pop(0)
+            continue
+
+        total_active_space = sum(download_model_sizes.get(task, 0) for task in active_downloads)
+
+        # Check for space and download
+        if free_space - model_size >= min_free_space and (total_active_space + model_size) <= total_space_to_use:
+            repo_name_queue.pop(0)
+            logger.info(f"Starting download for {repo_name}. Estimated size: {model_size:.2f} GB")
+            task = asyncio.create_task(download_and_upload_model(repo_name, local_download_model_dir, token))
+            active_downloads.append(task)
+            download_model_sizes[task] = model_size
+        else:
+            logger.info(f"Waiting for space... Current free space: {free_space:.2f} GB, Required: {model_size:.2f} GB")
+            await asyncio.sleep(10)
+
+        # Clean up finished tasks
+        done, active_downloads = await asyncio.wait(active_downloads, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+        for completed_task in done:
+            del download_model_sizes[completed_task]  # Free up space used by completed task
+
+    if active_downloads:
+        logger.info("Waiting for all active downloads to complete...")
+        await asyncio.gather(*active_downloads)
+
+async def main(repo_name_list: list, local_download_model_dir: str, token: str):
+    repo_name_queue = repo_name_list.copy()
+    await process_model_queue(repo_name_queue, local_download_model_dir, token)
 
 if __name__ == "__main__":
     # Inputs
     repo_name_list = [
         "google/gemma-2-2b-it",
-        "Qwen/Qwen2-1.5B"
+        "google/gemma-7b-it",
+        "google/gemma2-27b-it",
+        "google/gemma-2b",
+        "google/gemma2-9b-it",
+        "NousResearch/Meta-Llama-3.1-70B",
+        "Qwen/Qwen-1.8B",
+        "NousResearch/Meta-Llama-3.1-8B",
+        "NousResearch/Meta-Llama-3.1-70B-Instruct",
+        "Qwen/Qwen-1.8B-Chat",
+        "NousResearch/Meta-Llama-3.1-8B-Instruct",
+        "NousResearch/Meta-Llama-3.1-405B-FP8",
+        "Qwen/Qwen2-1.5B-Instruct",
+        "NousResearch/Llama-2-7b-hf",
+        "NousResearch/Llama-2-70b-chat-hf",
+        "Qwen/Qwen2-1.5B",
+        "NousResearch/Llama-2-13b-hf",
+        "mistralai/Mixtral-8x7B-v0.1",
+        "Qwen/Qwen2-0.5B-Instruct",
+        "mistralai/Mistral-7B-v0.1",
+        "mistral-community/Mixtral-8x22B-v0.1",
+        "Qwen/Qwen2-0.5B",
+        "mistralai/Mistral-7B-Instruct-v0.1",
+        "Qwen/Qwen-72B",
+        "Qwen/Qwen2-1.5B-Instruct-AWQ",
+        "mistralai/Mistral-7B-v0.3",
+        "Qwen/Qwen-72B-Chat",
+        "Qwen/Qwen2-0.5B-Instruct-AWQ",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "Qwen/Qwen-14B",
+        "Qwen/Qwen2-Math-1.5B",
+        "mistralai/Mistral-Nemo-Base-2407",
+        "Qwen/Qwen-14B-Chat",
+        "Qwen/Qwen2-72B-Instruct",
+        "Qwen/Qwen2-Math-1.5B-Instruct",
+        "mistralai/Mistral-Nemo-Instruct-2407",
+        "llava-hf/bakLlava-v1-hf",
+        "Qwen/Qwen-7B",
+        "Qwen/Qwen2-72B",
+        "Qwen/Qwen-7B-Chat",
+        "Qwen/Qwen2-72B-Instruct-AWQ",
+        "Qwen/Qwen2-beta-7B",
+        "Qwen/Qwen2-Math-72B",
+        "Qwen/Qwen2-beta-7B-Chat",
+        "Qwen/Qwen2-Math-72B-Instruct",
+        "Qwen/Qwen-7B-Chat-Int4",
+        "llava-hf/llava-1.5-13b-hf",
+        "Qwen/Qwen-7B-Chat-Int8",
+        "Qwen/Qwen2-7B-Instruct",
+        "Qwen/Qwen2-7B",
+        "Qwen/Qwen2-7B-Instruct-AWQ",
+        "Qwen/Qwen2-Math-7B",
+        "Qwen/Qwen2-Math-7B-Instruct",
+        "llava-hf/llava-1.5-7b-hf"
     ]
     local_download_model_dir = Path("models")
 
@@ -57,22 +195,4 @@ if __name__ == "__main__":
         logger.warning("HF token is not provided. Please export HF_TOKEN to the environment variable.")
         sys.exit(1)
 
-    failed_models = []
-
-    for repo_name in repo_name_list:
-        try:
-            logger.info(f"Processing model: {repo_name}")
-            download_and_upload_model(
-                repo_name=repo_name,
-                local_download_model_dir=local_download_model_dir,
-                token=token
-            )
-        except Exception as e:
-            logger.error(f"Failed to process model {repo_name}. Error: {e}")
-            failed_models.append(repo_name)
-
-    # Final logging of the summary
-    if failed_models:
-        logger.info(f"Processing complete. {len(failed_models)} models failed: {failed_models}")
-    else:
-        logger.info("All models have been successfully processed.")
+    asyncio.run(main(repo_name_list, local_download_model_dir, token))

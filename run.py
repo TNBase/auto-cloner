@@ -38,13 +38,33 @@ async def repo_exists(repo_name: str, token: str) -> bool:
             logger.error(f"Error checking repo existence for {repo_name}: {e}")
             raise e
 
-async def download_and_upload_model(repo_name: str, local_download_model_dir: str, token: str) -> None:
+async def org_repo_exists(org_name: str, repo_name: str, token: str) -> bool:
+    """
+    Check if the repo already exists in the organization on Hugging Face.
+    """
+    try:
+        repo_id = f"{org_name}/{repo_name}"
+        api.repo_info(repo_id=repo_id, token=token)
+        return True
+    except HTTPError as e:
+        if e.response.status_code == 404:
+            return False
+        else:
+            logger.error(f"Error checking repo existence for {repo_id}: {e}")
+            raise e
+
+async def download_and_upload_model(repo_name: str, local_download_model_dir: str, token: str, org_name: str) -> None:
     """
     Downloads a model from Hugging Face, uploads it to a target repository, and deletes the local copy.
     """
     try:
         local_model_dir = Path(local_download_model_dir) / Path(repo_name)
         model_name = repo_name.split("/")[-1]
+
+        # Check if the repo already exists in the organization
+        if await org_repo_exists(org_name, model_name, token):
+            logger.info(f"Repository {model_name} already exists in the organization {org_name}. Skipping download.")
+            return
 
         # Skip download if model already exists locally
         if local_model_dir.exists():
@@ -82,11 +102,11 @@ def get_free_space_gb() -> float:
     """Returns the available disk space in gigabytes."""
     return psutil.disk_usage("/").free / (1024 ** 3)
 
-async def process_model_queue(repo_name_queue, local_download_model_dir, token):
+async def process_model_queue(repo_name_queue, local_download_model_dir, token, org_name):
     """
     Processes the queue of models and ensures the disk space constraints are met.
     """
-    active_downloads = []  # Track active downloads
+    active_downloads = []  # Initialize active downloads as a list
     total_space_to_use = 900  # The total space the script can use (900GB)
     min_free_space = 100  # Leave 100GB free at all times
     download_model_sizes = {}  # Store estimated model sizes to manage space
@@ -109,7 +129,7 @@ async def process_model_queue(repo_name_queue, local_download_model_dir, token):
         if free_space - model_size >= min_free_space and (total_active_space + model_size) <= total_space_to_use:
             repo_name_queue.pop(0)
             logger.info(f"Starting download for {repo_name}. Estimated size: {model_size:.2f} GB")
-            task = asyncio.create_task(download_and_upload_model(repo_name, local_download_model_dir, token))
+            task = asyncio.create_task(download_and_upload_model(repo_name, local_download_model_dir, token, org_name))
             active_downloads.append(task)
             download_model_sizes[task] = model_size
         else:
@@ -117,17 +137,18 @@ async def process_model_queue(repo_name_queue, local_download_model_dir, token):
             await asyncio.sleep(10)
 
         # Clean up finished tasks
-        done, active_downloads = await asyncio.wait(active_downloads, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(active_downloads, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
         for completed_task in done:
             del download_model_sizes[completed_task]  # Free up space used by completed task
+        active_downloads = list(pending)  # Update the list of active downloads
 
     if active_downloads:
         logger.info("Waiting for all active downloads to complete...")
         await asyncio.gather(*active_downloads)
 
-async def main(repo_name_list: list, local_download_model_dir: str, token: str):
+async def main(repo_name_list: list, local_download_model_dir: str, token: str, org_name: str):
     repo_name_queue = repo_name_list.copy()
-    await process_model_queue(repo_name_queue, local_download_model_dir, token)
+    await process_model_queue(repo_name_queue, local_download_model_dir, token, org_name)
 
 if __name__ == "__main__":
     # Inputs
@@ -195,4 +216,10 @@ if __name__ == "__main__":
         logger.warning("HF token is not provided. Please export HF_TOKEN to the environment variable.")
         sys.exit(1)
 
-    asyncio.run(main(repo_name_list, local_download_model_dir, token))
+    # Get organization name from environment variables
+    org_name = os.getenv("ORG_NAME")
+    if not org_name:
+        logger.warning("Organization name is not provided. Please export ORG_NAME to the environment variable.")
+        sys.exit(1)
+
+    asyncio.run(main(repo_name_list, local_download_model_dir, token, org_name))

@@ -6,7 +6,7 @@ from loguru import logger
 from utils import download_from_hf, push_to_hub
 import asyncio
 import psutil
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi
 from requests.exceptions import HTTPError
 
 api = HfApi()
@@ -24,25 +24,33 @@ async def get_model_size(repo_name: str, token: str) -> float:
         logger.error(f"Failed to retrieve size for {repo_name}: {e}")
         raise e
 
-async def repo_exists_and_has_all_files(repo_name: str, local_model_dir: Path, token: str) -> bool:
+async def repo_exists(repo_name: str, token: str) -> bool:
     """
-    Checks if the repo exists and if all files from the local directory are present in the Hugging Face repo.
+    Check if the repo already exists on Hugging Face.
     """
     try:
-        model_info = api.model_info(repo_name, token=token)
-        remote_files = {file.rfilename for file in model_info.siblings}
-        local_files = {str(file.relative_to(local_model_dir)) for file in local_model_dir.rglob("*") if file.is_file()}
-        
-        if remote_files >= local_files:
-            return True  # All local files are in the remote repo
-        else:
-            logger.info(f"Some files are missing in {repo_name}.")
-            return False
+        api.repo_info(repo_id=repo_name.split("/")[-1], token=token)
+        return True
     except HTTPError as e:
         if e.response.status_code == 404:
-            return False  # Repo doesn't exist
+            return False
         else:
             logger.error(f"Error checking repo existence for {repo_name}: {e}")
+            raise e
+
+async def org_repo_exists(org_name: str, repo_name: str, token: str) -> bool:
+    """
+    Check if the repo already exists in the organization on Hugging Face.
+    """
+    try:
+        repo_id = f"{org_name}/{repo_name}"
+        api.repo_info(repo_id=repo_id, token=token)
+        return True
+    except HTTPError as e:
+        if e.response.status_code == 404:
+            return False
+        else:
+            logger.error(f"Error checking repo existence for {repo_id}: {e}")
             raise e
 
 async def download_and_upload_model(repo_name: str, local_download_model_dir: str, token: str, org_name: str) -> None:
@@ -53,9 +61,9 @@ async def download_and_upload_model(repo_name: str, local_download_model_dir: st
         local_model_dir = Path(local_download_model_dir) / Path(repo_name)
         model_name = repo_name.split("/")[-1]
 
-        # Check if the repo already exists and has all files in the organization
-        if await repo_exists_and_has_all_files(f"{org_name}/{model_name}", local_model_dir, token):
-            logger.info(f"Repository {model_name} already exists with all files in the organization {org_name}. Skipping download.")
+        # Check if the repo already exists in the organization
+        if await org_repo_exists(org_name, model_name, token):
+            logger.info(f"Repository {model_name} already exists in the organization {org_name}. Skipping download.")
             return
 
         # Skip download if model already exists locally
@@ -67,12 +75,14 @@ async def download_and_upload_model(repo_name: str, local_download_model_dir: st
             download_from_hf(repo_name=repo_name, local_model_dir=local_model_dir, file_name=None, token=token)
             logger.info(f"Successfully downloaded model: {repo_name}")
 
-        # Create the repo if it doesn't exist in the organization
-        if not await repo_exists_and_has_all_files(model_name, local_model_dir, token):
+        # Upload the model if repo doesn't already exist
+        if await repo_exists(model_name, token):
+            logger.info(f"Repository {model_name} already exists. Skipping creation.")
+        else:
             logger.info(f"Creating repository {model_name}")
-            api.create_repo(repo_id=f"{org_name}/{model_name}", token=token, repo_type="model")
+            api.create_repo(repo_id=model_name, token=token, repo_type="model")
 
-        push_to_hub(model_name=f"{org_name}/{model_name}", model_path=local_model_dir, token=token)
+        push_to_hub(model_name=model_name, model_path=local_model_dir, token=token)
         logger.info(f"Successfully uploaded model: {model_name}")
 
     except Exception as e:
@@ -100,7 +110,6 @@ async def process_model_queue(repo_name_queue, local_download_model_dir, token, 
     total_space_to_use = 900  # The total space the script can use (900GB)
     min_free_space = 100  # Leave 100GB free at all times
     download_model_sizes = {}  # Store estimated model sizes to manage space
-    repos_to_upload = []  # List of repos missing files or not present
 
     while repo_name_queue:
         repo_name = repo_name_queue[0]
@@ -144,58 +153,60 @@ async def main(repo_name_list: list, local_download_model_dir: str, token: str, 
 if __name__ == "__main__":
     # Inputs
     repo_name_list = [
-#         "google/gemma-2-2b-it",
-#         "google/gemma-7b-it",
-#         "google/gemma-2b",
-#         "NousResearch/Meta-Llama-3.1-70B",
-#         "Qwen/Qwen-1.8B",
-#         "NousResearch/Meta-Llama-3.1-8B",
+        # "google/gemma-2-2b-it",
+        # "google/gemma-7b-it",
+        # "google/gemma2-27b-it",
+        # "google/gemma-2b",
+        # "google/gemma2-9b-it",
+        # "NousResearch/Meta-Llama-3.1-70B",
+        # "Qwen/Qwen-1.8B",
+        # "NousResearch/Meta-Llama-3.1-8B",
         "NousResearch/Meta-Llama-3.1-70B-Instruct",
-#         "Qwen/Qwen-1.8B-Chat",
-#         "NousResearch/Meta-Llama-3.1-8B-Instruct",
-#         "NousResearch/Meta-Llama-3.1-405B-FP8",
-#         "Qwen/Qwen2-1.5B-Instruct",
-#         "NousResearch/Llama-2-7b-hf",
-#         "NousResearch/Llama-2-70b-chat-hf",
-#         "Qwen/Qwen2-1.5B",
-#         "NousResearch/Llama-2-13b-hf",
-#         "mistralai/Mixtral-8x7B-v0.1",
-#         "Qwen/Qwen2-0.5B-Instruct",
-#         "mistralai/Mistral-7B-v0.1",
-#         "mistral-community/Mixtral-8x22B-v0.1",
-#         "Qwen/Qwen2-0.5B",
-#         "mistralai/Mistral-7B-Instruct-v0.1",
-#         "Qwen/Qwen-72B",
-#         "Qwen/Qwen2-1.5B-Instruct-AWQ",
-#         "mistralai/Mistral-7B-v0.3",
+        # "Qwen/Qwen-1.8B-Chat",
+        # "NousResearch/Meta-Llama-3.1-8B-Instruct",
+        # "NousResearch/Meta-Llama-3.1-405B-FP8",
+        # "Qwen/Qwen2-1.5B-Instruct",
+        # "NousResearch/Llama-2-7b-hf",
+        # "NousResearch/Llama-2-70b-chat-hf",
+        # "Qwen/Qwen2-1.5B",
+        # "NousResearch/Llama-2-13b-hf",
+        # "mistralai/Mixtral-8x7B-v0.1",
+        # "Qwen/Qwen2-0.5B-Instruct",
+        # "mistralai/Mistral-7B-v0.1",
+        # "mistral-community/Mixtral-8x22B-v0.1",
+        # "Qwen/Qwen2-0.5B",
+        # "mistralai/Mistral-7B-Instruct-v0.1",
+        # "Qwen/Qwen-72B",
+        # "Qwen/Qwen2-1.5B-Instruct-AWQ",
+        # "mistralai/Mistral-7B-v0.3",
         "Qwen/Qwen-72B-Chat"
-#         "Qwen/Qwen2-0.5B-Instruct-AWQ",
-#         "mistralai/Mistral-7B-Instruct-v0.3",
-#         "Qwen/Qwen-14B",
-#         "Qwen/Qwen2-Math-1.5B",
-#         "mistralai/Mistral-Nemo-Base-2407",
-#         "Qwen/Qwen-14B-Chat",
-#         "Qwen/Qwen2-72B-Instruct",
-#         "Qwen/Qwen2-Math-1.5B-Instruct",
-#         "mistralai/Mistral-Nemo-Instruct-2407",
-#         "llava-hf/bakLlava-v1-hf",
-#         "Qwen/Qwen-7B",
-#         "Qwen/Qwen2-72B",
-#         "Qwen/Qwen-7B-Chat",
-#         "Qwen/Qwen2-72B-Instruct-AWQ",
-#         "Qwen/Qwen2-beta-7B",
-#         "Qwen/Qwen2-Math-72B",
-#         "Qwen/Qwen2-beta-7B-Chat",
-#         "Qwen/Qwen2-Math-72B-Instruct",
-#         "Qwen/Qwen-7B-Chat-Int4",
-#         "llava-hf/llava-1.5-13b-hf",
-#         "Qwen/Qwen-7B-Chat-Int8",
-#         "Qwen/Qwen2-7B-Instruct",
-#         "Qwen/Qwen2-7B",
-#         "Qwen/Qwen2-7B-Instruct-AWQ",
-#         "Qwen/Qwen2-Math-7B",
-#         "Qwen/Qwen2-Math-7B-Instruct",
-#         "llava-hf/llava-1.5-7b-hf"
+        # "Qwen/Qwen2-0.5B-Instruct-AWQ",
+        # "mistralai/Mistral-7B-Instruct-v0.3",
+        # "Qwen/Qwen-14B",
+        # "Qwen/Qwen2-Math-1.5B",
+        # "mistralai/Mistral-Nemo-Base-2407",
+        # "Qwen/Qwen-14B-Chat",
+        # "Qwen/Qwen2-72B-Instruct",
+        # "Qwen/Qwen2-Math-1.5B-Instruct",
+        # "mistralai/Mistral-Nemo-Instruct-2407",
+        # "llava-hf/bakLlava-v1-hf",
+        # "Qwen/Qwen-7B",
+        # "Qwen/Qwen2-72B",
+        # "Qwen/Qwen-7B-Chat",
+        # "Qwen/Qwen2-72B-Instruct-AWQ",
+        # "Qwen/Qwen2-beta-7B",
+        # "Qwen/Qwen2-Math-72B",
+        # "Qwen/Qwen2-beta-7B-Chat",
+        # "Qwen/Qwen2-Math-72B-Instruct",
+        # "Qwen/Qwen-7B-Chat-Int4",
+        # "llava-hf/llava-1.5-13b-hf",
+        # "Qwen/Qwen-7B-Chat-Int8",
+        # "Qwen/Qwen2-7B-Instruct",
+        # "Qwen/Qwen2-7B",
+        # "Qwen/Qwen2-7B-Instruct-AWQ",
+        # "Qwen/Qwen2-Math-7B",
+        # "Qwen/Qwen2-Math-7B-Instruct",
+        # "llava-hf/llava-1.5-7b-hf"
     ]
     local_download_model_dir = Path("models")
 

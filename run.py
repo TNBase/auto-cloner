@@ -48,6 +48,7 @@ async def repo_exists_and_has_all_files(repo_name: str, local_model_dir: Path, t
 async def download_and_upload_model(repo_name: str, local_download_model_dir: str, token: str, org_name: str) -> None:
     """
     Downloads a model from Hugging Face, uploads it to a target repository, and deletes the local copy.
+    If the upload fails, the created repository is deleted from the organization.
     """
     try:
         local_model_dir = Path(local_download_model_dir) / Path(repo_name)
@@ -72,8 +73,18 @@ async def download_and_upload_model(repo_name: str, local_download_model_dir: st
             logger.info(f"Creating repository {model_name}")
             api.create_repo(repo_id=f"{org_name}/{model_name}", token=token, repo_type="model")
 
-        push_to_hub(model_name=f"{org_name}/{model_name}", model_path=local_model_dir, token=token)
-        logger.info(f"Successfully uploaded model: {model_name}")
+        # Try to upload the model
+        try:
+            push_to_hub(model_name=f"{org_name}/{model_name}", model_path=local_model_dir, token=token)
+            logger.info(f"Successfully uploaded model: {model_name}")
+        except Exception as upload_error:
+            logger.error(f"Upload failed for {model_name}. Attempting to delete the repository.")
+            try:
+                api.delete_repo(repo_id=f"{org_name}/{model_name}", token=token)
+                logger.info(f"Successfully deleted repository {model_name} due to failed upload.")
+            except Exception as delete_error:
+                logger.error(f"Failed to delete repository {model_name}. Error: {delete_error}")
+            raise upload_error  # Reraise the upload error to propagate failure
 
     except Exception as e:
         logger.error(f"Error during process for {repo_name}. Error: {e}")

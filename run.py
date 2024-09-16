@@ -6,10 +6,56 @@ from loguru import logger
 from utils import download_from_hf, push_to_hub
 import asyncio
 import psutil
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi
 from requests.exceptions import HTTPError
 
 api = HfApi()
+
+def get_access_link(repo_name: str) -> str:
+    """
+    Constructs the Hugging Face URL for the given repository.
+    """
+    return f"https://huggingface.co/{repo_name}"
+
+def is_redistribution_allowed(repo_name: str, token: str) -> bool:
+    """
+    Checks if redistribution is allowed for the given model based on its license.
+    """
+    try:
+        model_info = api.model_info(repo_name, token=token)
+        license = None
+
+        # Try to get license from model_info.license (may not exist)
+        if hasattr(model_info, 'license') and model_info.license:
+            license = model_info.license
+
+        # Try to get license from model_info.cardData
+        if not license and hasattr(model_info, 'cardData') and model_info.cardData:
+            license = model_info.cardData.get('license')
+
+        # Try to get license from model_info.tags
+        if not license and model_info.tags:
+            for tag in model_info.tags:
+                if tag.startswith('license:'):
+                    license = tag.split('license:')[1]
+                    break
+
+        if not license:
+            logger.warning(f"License information not available for {repo_name}.")
+            return False
+
+        # List of licenses that allow redistribution
+        allowed_licenses = ["mit", "apache-2.0", "bsd-3-clause", "cc-by-4.0", "cc0-1.0", "unlicense"]
+
+        if license.lower() in allowed_licenses:
+            return True
+        else:
+            logger.warning(f"Redistribution prohibited for {repo_name} under license: {license}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Failed to retrieve license for {repo_name}: {e}")
+        return False
 
 async def get_model_size(repo_name: str, token: str) -> float:
     """
@@ -32,7 +78,7 @@ async def repo_exists_and_has_all_files(repo_name: str, local_model_dir: Path, t
         model_info = api.model_info(repo_name, token=token)
         remote_files = {file.rfilename for file in model_info.siblings}
         local_files = {str(file.relative_to(local_model_dir)) for file in local_model_dir.rglob("*") if file.is_file()}
-        
+
         if remote_files >= local_files:
             return True  # All local files are in the remote repo
         else:
@@ -45,18 +91,29 @@ async def repo_exists_and_has_all_files(repo_name: str, local_model_dir: Path, t
             logger.error(f"Error checking repo existence for {repo_name}: {e}")
             raise e
 
-async def download_and_upload_model(repo_name: str, local_download_model_dir: str, token: str, org_name: str) -> None:
+async def download_and_upload_model(repo_name: str, local_download_model_dir: str, token: str, org_name: str, model_status: dict) -> None:
     """
     Downloads a model from Hugging Face, uploads it to a target repository, and deletes the local copy.
-    If the upload fails, the created repository is deleted from the organization.
+    Updates the model_status dictionary with the status of the model.
     """
+    model_name = Path(repo_name).name
     try:
-        local_model_dir = Path(local_download_model_dir) / Path(repo_name)
-        model_name = repo_name.split("/")[-1]
+        # Check if redistribution is allowed
+        if not is_redistribution_allowed(repo_name, token):
+            logger.warning(f"Redistribution prohibited for {repo_name}. Skipping upload.")
+            model_status[repo_name] = "Cannot upload due to license restrictions"
+            # Proceed to check if manual acceptance is needed
+            access_link = get_access_link(repo_name)
+            print(f"\nThe model {repo_name} may require manual license acceptance or access request.")
+            print(f"Please visit {access_link} to accept the license agreement or request access if needed.\n")
+            return
+
+        local_model_dir = Path(local_download_model_dir) / model_name
 
         # Check if the repo already exists and has all files in the organization
         if await repo_exists_and_has_all_files(f"{org_name}/{model_name}", local_model_dir, token):
             logger.info(f"Repository {model_name} already exists with all files in the organization {org_name}. Skipping download.")
+            model_status[repo_name] = "Already exists in the organization"
             return
 
         # Skip download if model already exists locally
@@ -69,7 +126,7 @@ async def download_and_upload_model(repo_name: str, local_download_model_dir: st
             logger.info(f"Successfully downloaded model: {repo_name}")
 
         # Create the repo if it doesn't exist in the organization
-        if not await repo_exists_and_has_all_files(model_name, local_model_dir, token):
+        if not await repo_exists_and_has_all_files(f"{org_name}/{model_name}", local_model_dir, token):
             logger.info(f"Creating repository {model_name}")
             api.create_repo(repo_id=f"{org_name}/{model_name}", token=token, repo_type="model")
 
@@ -77,6 +134,7 @@ async def download_and_upload_model(repo_name: str, local_download_model_dir: st
         try:
             push_to_hub(model_name=f"{org_name}/{model_name}", model_path=local_model_dir, token=token)
             logger.info(f"Successfully uploaded model: {model_name}")
+            model_status[repo_name] = "Uploaded successfully"
         except Exception as upload_error:
             logger.error(f"Upload failed for {model_name}. Attempting to delete the repository.")
             try:
@@ -84,10 +142,12 @@ async def download_and_upload_model(repo_name: str, local_download_model_dir: st
                 logger.info(f"Successfully deleted repository {model_name} due to failed upload.")
             except Exception as delete_error:
                 logger.error(f"Failed to delete repository {model_name}. Error: {delete_error}")
+            model_status[repo_name] = f"Upload failed: {upload_error}"
             raise upload_error  # Reraise the upload error to propagate failure
 
     except Exception as e:
         logger.error(f"Error during process for {repo_name}. Error: {e}")
+        model_status[repo_name] = f"Failed: {e}"
 
     finally:
         # Ensure cleanup happens
@@ -103,15 +163,15 @@ def get_free_space_gb() -> float:
     """Returns the available disk space in gigabytes."""
     return psutil.disk_usage("/").free / (1024 ** 3)
 
-async def process_model_queue(repo_name_queue, local_download_model_dir, token, org_name):
+async def process_model_queue(repo_name_queue, local_download_model_dir, token, org_name, model_status):
     """
     Processes the queue of models and ensures the disk space constraints are met.
+    Updates the model_status dictionary with the status of each model.
     """
     active_downloads = []  # Initialize active downloads as a list
     total_space_to_use = 900  # The total space the script can use (900GB)
     min_free_space = 100  # Leave 100GB free at all times
     download_model_sizes = {}  # Store estimated model sizes to manage space
-    repos_to_upload = []  # List of repos missing files or not present
 
     while repo_name_queue:
         repo_name = repo_name_queue[0]
@@ -122,6 +182,7 @@ async def process_model_queue(repo_name_queue, local_download_model_dir, token, 
             model_size = await get_model_size(repo_name, token)
         except Exception as e:
             logger.error(f"Skipping model {repo_name} due to error: {e}")
+            model_status[repo_name] = f"Failed to get size: {e}"
             repo_name_queue.pop(0)
             continue
 
@@ -131,7 +192,7 @@ async def process_model_queue(repo_name_queue, local_download_model_dir, token, 
         if free_space - model_size >= min_free_space and (total_active_space + model_size) <= total_space_to_use:
             repo_name_queue.pop(0)
             logger.info(f"Starting download for {repo_name}. Estimated size: {model_size:.2f} GB")
-            task = asyncio.create_task(download_and_upload_model(repo_name, local_download_model_dir, token, org_name))
+            task = asyncio.create_task(download_and_upload_model(repo_name, local_download_model_dir, token, org_name, model_status))
             active_downloads.append(task)
             download_model_sizes[task] = model_size
         else:
@@ -150,63 +211,73 @@ async def process_model_queue(repo_name_queue, local_download_model_dir, token, 
 
 async def main(repo_name_list: list, local_download_model_dir: str, token: str, org_name: str):
     repo_name_queue = repo_name_list.copy()
-    await process_model_queue(repo_name_queue, local_download_model_dir, token, org_name)
+    model_status = {}  # Dictionary to keep track of model statuses
+    await process_model_queue(repo_name_queue, local_download_model_dir, token, org_name, model_status)
+
+    # Output the summary after processing all models
+    print("\nSummary of model processing:")
+    print("{:<50} {}".format("Model", "Status"))
+    print("-" * 70)
+    for repo_name, status in model_status.items():
+        print("{:<50} {}".format(repo_name, status))
 
 if __name__ == "__main__":
     # Inputs
     repo_name_list = [
-#         "google/gemma-2-2b-it",
-#         "google/gemma-7b-it",
-#         "google/gemma-2b",
-#         "NousResearch/Meta-Llama-3.1-70B",
-#         "Qwen/Qwen-1.8B",
-#         "NousResearch/Meta-Llama-3.1-8B",
+        "google/gemma-2-2b-it",
+        "google/gemma-7b-it",
+        "google/gemma2-27b-it",
+        "google/gemma-2b",
+        "google/gemma2-9b-it",
+        "NousResearch/Meta-Llama-3.1-70B",
+        "Qwen/Qwen-1.8B",
+        "NousResearch/Meta-Llama-3.1-8B",
         "NousResearch/Meta-Llama-3.1-70B-Instruct",
-#         "Qwen/Qwen-1.8B-Chat",
-#         "NousResearch/Meta-Llama-3.1-8B-Instruct",
-#         "NousResearch/Meta-Llama-3.1-405B-FP8",
-#         "Qwen/Qwen2-1.5B-Instruct",
-#         "NousResearch/Llama-2-7b-hf",
-#         "NousResearch/Llama-2-70b-chat-hf",
-#         "Qwen/Qwen2-1.5B",
-#         "NousResearch/Llama-2-13b-hf",
-#         "mistralai/Mixtral-8x7B-v0.1",
-#         "Qwen/Qwen2-0.5B-Instruct",
-#         "mistralai/Mistral-7B-v0.1",
-#         "mistral-community/Mixtral-8x22B-v0.1",
-#         "Qwen/Qwen2-0.5B",
-#         "mistralai/Mistral-7B-Instruct-v0.1",
-#         "Qwen/Qwen-72B",
-#         "Qwen/Qwen2-1.5B-Instruct-AWQ",
-#         "mistralai/Mistral-7B-v0.3",
-        "Qwen/Qwen-72B-Chat"
-#         "Qwen/Qwen2-0.5B-Instruct-AWQ",
-#         "mistralai/Mistral-7B-Instruct-v0.3",
-#         "Qwen/Qwen-14B",
-#         "Qwen/Qwen2-Math-1.5B",
-#         "mistralai/Mistral-Nemo-Base-2407",
-#         "Qwen/Qwen-14B-Chat",
-#         "Qwen/Qwen2-72B-Instruct",
-#         "Qwen/Qwen2-Math-1.5B-Instruct",
-#         "mistralai/Mistral-Nemo-Instruct-2407",
-#         "llava-hf/bakLlava-v1-hf",
-#         "Qwen/Qwen-7B",
-#         "Qwen/Qwen2-72B",
-#         "Qwen/Qwen-7B-Chat",
-#         "Qwen/Qwen2-72B-Instruct-AWQ",
-#         "Qwen/Qwen2-beta-7B",
-#         "Qwen/Qwen2-Math-72B",
-#         "Qwen/Qwen2-beta-7B-Chat",
-#         "Qwen/Qwen2-Math-72B-Instruct",
-#         "Qwen/Qwen-7B-Chat-Int4",
-#         "llava-hf/llava-1.5-13b-hf",
-#         "Qwen/Qwen-7B-Chat-Int8",
-#         "Qwen/Qwen2-7B-Instruct",
-#         "Qwen/Qwen2-7B",
-#         "Qwen/Qwen2-7B-Instruct-AWQ",
-#         "Qwen/Qwen2-Math-7B",
-#         "Qwen/Qwen2-Math-7B-Instruct",
-#         "llava-hf/llava-1.5-7b-hf"
+        "Qwen/Qwen-1.8B-Chat",
+        "NousResearch/Meta-Llama-3.1-8B-Instruct",
+        "NousResearch/Meta-Llama-3.1-405B-FP8",
+        "Qwen/Qwen2-1.5B-Instruct",
+        "NousResearch/Llama-2-7b-hf",
+        "NousResearch/Llama-2-70b-chat-hf",
+        "Qwen/Qwen2-1.5B",
+        "NousResearch/Llama-2-13b-hf",
+        "mistralai/Mixtral-8x7B-v0.1",
+        "Qwen/Qwen2-0.5B-Instruct",
+        "mistralai/Mistral-7B-v0.1",
+        "mistral-community/Mixtral-8x22B-v0.1",
+        "Qwen/Qwen2-0.5B",
+        "mistralai/Mistral-7B-Instruct-v0.1",
+        "Qwen/Qwen-72B",
+        "Qwen/Qwen2-1.5B-Instruct-AWQ",
+        "mistralai/Mistral-7B-v0.3",
+        "Qwen/Qwen-72B-Chat",
+        "Qwen/Qwen2-0.5B-Instruct-AWQ",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "Qwen/Qwen-14B",
+        "Qwen/Qwen2-Math-1.5B",
+        "mistralai/Mistral-Nemo-Base-2407",
+        "Qwen/Qwen-14B-Chat",
+        "Qwen/Qwen2-72B-Instruct",
+        "Qwen/Qwen2-Math-1.5B-Instruct",
+        "mistralai/Mistral-Nemo-Instruct-2407",
+        "llava-hf/bakLlava-v1-hf",
+        "Qwen/Qwen-7B",
+        "Qwen/Qwen2-72B",
+        "Qwen/Qwen-7B-Chat",
+        "Qwen/Qwen2-72B-Instruct-AWQ",
+        "Qwen/Qwen2-beta-7B",
+        "Qwen/Qwen2-Math-72B",
+        "Qwen/Qwen2-beta-7B-Chat",
+        "Qwen/Qwen2-Math-72B-Instruct",
+        "Qwen/Qwen-7B-Chat-Int4",
+        "llava-hf/llava-1.5-13b-hf",
+        "Qwen/Qwen-7B-Chat-Int8",
+        "Qwen/Qwen2-7B-Instruct",
+        "Qwen/Qwen2-7B",
+        "Qwen/Qwen2-7B-Instruct-AWQ",
+        "Qwen/Qwen2-Math-7B",
+        "Qwen/Qwen2-Math-7B-Instruct",
+        "llava-hf/llava-1.5-7b-hf"
     ]
     local_download_model_dir = Path("models")
 

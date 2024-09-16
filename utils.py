@@ -121,7 +121,7 @@ def push_to_hub(model_name: str, model_path: str, token: str) -> None:
         model_path (str): path to the local model directory
         token (str): HF token
     """
-    hub_id = f"TitanML/{model_name}"
+    hub_id = f"{model_name}"
     api = HfApi(token=token)
 
     create_repo(hub_id, token=token, repo_type="model")

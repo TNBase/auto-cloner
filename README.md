@@ -34,6 +34,7 @@ Before using Auto Cloner, ensure you have the following:
 3. To authenticate with Hugging Face, you'll need to export your Hugging Face API token as an environment variable:
    ```bash 
    export HF_TOKEN=<your_hugging_face_token>
+   export ORG_NAME=<your_designated_organisation_name>
    ```
 
 ### Step 4: Run the Script
